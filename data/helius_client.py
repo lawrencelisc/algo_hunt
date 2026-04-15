@@ -1,33 +1,27 @@
-# APEX — Helius RPC Client (Real On-chain Data)
-# Replaces MockOnChainFetcher in Phase 2
-# Docs: https://docs.helius.dev
+# APEX — Helius Client (Free Tier Compatible)
+# Uses standard JSON-RPC only — no paid REST endpoints
 
 import json
 import logging
-import urllib.parse
 import urllib.request
 from datetime import datetime
 from typing import Optional
+import random
 
 logger = logging.getLogger("apex.helius")
 
 
 class HeliusClient:
-    """
-    Real Helius RPC client.
-    Replaces MockOnChainFetcher — drop-in compatible interface.
-    """
 
     def __init__(self, api_key: str):
-        self.api_key  = api_key
-        self.rpc_url  = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
-        self.api_url  = f"https://api.helius.xyz/v0"
+        self.api_key = api_key
+        self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
 
     # ─────────────────────────────────────────
-    #  HTTP HELPERS
+    #  JSON-RPC  (Free tier supported)
     # ─────────────────────────────────────────
 
-    def _post_rpc(self, method: str, params: list) -> dict:
+    def _rpc(self, method: str, params: list) -> dict:
         payload = json.dumps({
             "jsonrpc": "2.0",
             "id":      1,
@@ -47,234 +41,163 @@ class HeliusClient:
             logger.error(f"[HELIUS] RPC {method} failed: {e}")
             return {}
 
-    def _get_api(self, path: str, params: dict = {}) -> dict:
-        params["api-key"] = self.api_key
-        url = self.api_url + path + "?" + urllib.parse.urlencode(params)
-        try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                return json.loads(resp.read())
-        except Exception as e:
-            logger.error(f"[HELIUS] API {path} failed: {e}")
-            return {}
-
-    def _post_api(self, path: str, body: dict) -> dict:
-        url     = self.api_url + path + f"?api-key={self.api_key}"
-        payload = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data    = payload,
-            headers = {"Content-Type": "application/json"},
-            method  = "POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read())
-        except Exception as e:
-            logger.error(f"[HELIUS] API POST {path} failed: {e}")
-            return {}
-
     # ─────────────────────────────────────────
-    #  CORE: ON-CHAIN FLOW  (replaces mock)
+    #  VOLUME DATA  (Free tier via RPC)
     # ─────────────────────────────────────────
 
     async def get_volume_data(self, mint_address: str, scenario: str = "") -> dict:
         """
-        Drop-in replacement for MockOnChainFetcher.get_volume_data()
-        Returns: volume_sigma, netflow_usd, buy_count, sell_count, unique_wallets
+        Free tier: use getTokenLargestAccounts + getTokenSupply
+        to approximate concentration and activity level.
         """
-        # 1. Get recent transactions for this mint
-        txs = self._get_token_transactions(mint_address, limit=100)
+        # Get token supply
+        supply_resp = self._rpc("getTokenSupply", [mint_address])
+        supply_val  = supply_resp.get("result", {}).get("value", {})
+        supply      = float(supply_val.get("uiAmount", 0) or 0)
 
-        if not txs:
-            logger.warning(f"[HELIUS] No transactions for {mint_address}")
-            return {
-                "mint":           mint_address,
-                "volume_sigma":   0.0,
-                "netflow_usd":    0.0,
-                "buy_count":      0,
-                "sell_count":     0,
-                "unique_wallets": 0,
-            }
+        # Get largest accounts (whale concentration proxy)
+        holders_resp = self._rpc("getTokenLargestAccounts", [mint_address])
+        holders      = holders_resp.get("result", {}).get("value", [])
 
-        # 2. Calculate buy/sell flows
-        buy_vol  = 0.0
-        sell_vol = 0.0
-        buy_count  = 0
-        sell_count = 0
-        wallets    = set()
+        if not holders or supply == 0:
+            logger.warning(f"[HELIUS] No data for {mint_address[:12]}...")
+            return self._empty_result(mint_address)
 
-        for tx in txs:
-            tx_type = tx.get("type", "")
-            amount  = float(tx.get("nativeTransfers", [{}])[0].get("amount", 0)) / 1e9
+        # Calculate concentration sigma
+        # High concentration in top holder = unusual activity
+        top_holder_pct = float(holders[0].get("uiAmount", 0)) / supply if supply > 0 else 0
+        top5_pct       = sum(float(h.get("uiAmount", 0)) for h in holders[:5]) / supply if supply > 0 else 0
 
-            if tx_type in ("SWAP", "TOKEN_MINT"):
-                buy_vol  += amount
-                buy_count += 1
-            elif tx_type in ("TRANSFER",):
-                sell_vol  += amount
-                sell_count += 1
+        # Sigma approximation:
+        # Normal distribution: top holder ~5%, top5 ~25%
+        # Anomaly: top holder >20%, top5 >60%
+        concentration_score = (top_holder_pct / 0.05) if top_holder_pct > 0 else 0
+        sigma = min(concentration_score * 2, 15.0)
 
-            # Track unique wallets
-            for acct in tx.get("accountData", []):
-                wallets.add(acct.get("account", ""))
-
-        netflow_usd = (buy_vol - sell_vol) * self._get_sol_price()
-
-        # 3. Calculate volume sigma vs 24h baseline
-        # Simple approximation: compare last 1h vs 24h average
-        vol_total  = buy_vol + sell_vol
-        baseline   = vol_total / 24 if vol_total > 0 else 1
-        vol_1h     = vol_total / max(len(txs) / 24, 1)
-        sigma      = (vol_1h - baseline) / max(baseline * 0.2, 0.001)
+        # Netflow approximation from holder count
+        holder_count = len(holders)
+        netflow_est  = holder_count * 1000  # rough proxy
 
         logger.info(
             f"[HELIUS] {mint_address[:8]}... | "
-            f"buys={buy_count} sells={sell_count} "
-            f"netflow=${netflow_usd:.0f} σ={sigma:.1f}"
+            f"top_holder={top_holder_pct:.1%} top5={top5_pct:.1%} "
+            f"σ≈{sigma:.1f} holders={holder_count}"
         )
 
         return {
             "mint":           mint_address,
-            "volume_sigma":   round(max(sigma, 0), 2),
-            "netflow_usd":    round(netflow_usd, 2),
-            "buy_count":      buy_count,
-            "sell_count":     sell_count,
-            "unique_wallets": len(wallets),
+            "volume_sigma":   round(sigma, 2),
+            "netflow_usd":    round(netflow_est, 0),
+            "buy_count":      holder_count,
+            "sell_count":     0,
+            "unique_wallets": holder_count,
         }
 
     # ─────────────────────────────────────────
-    #  TOKEN TRANSACTIONS
-    # ─────────────────────────────────────────
-
-    def _get_token_transactions(self, mint_address: str, limit: int = 100) -> list:
-        """Get recent transactions involving this token mint."""
-        resp = self._post_api(f"/addresses/{mint_address}/transactions", {
-            "limit": limit,
-            "type":  "SWAP",
-        })
-        if isinstance(resp, list):
-            return resp
-        return resp.get("transactions", [])
-
-    # ─────────────────────────────────────────
-    #  HONEYPOT CHECK  (replaces mock)
+    #  HONEYPOT CHECK  (Free tier)
     # ─────────────────────────────────────────
 
     async def check_honeypot(self, mint_address: str) -> bool:
-        """
-        Check if token has suspicious characteristics.
-        Returns True if honeypot risk detected.
-        """
-        resp = self._post_rpc("getAccountInfo", [
+        resp = self._rpc("getAccountInfo", [
             mint_address,
             {"encoding": "jsonParsed"}
         ])
-
         result = resp.get("result", {})
         if not result or not result.get("value"):
-            logger.warning(f"[HELIUS] No account info for {mint_address}")
-            return True  # Treat unknown as risky
+            return True  # Unknown = risky
 
-        # Check mint authority (honeypots often retain mint authority)
-        data = result.get("value", {}).get("data", {})
+        data   = result.get("value", {}).get("data", {})
         parsed = data.get("parsed", {}) if isinstance(data, dict) else {}
         info   = parsed.get("info", {})
 
-        mint_authority = info.get("mintAuthority")
-        freeze_auth    = info.get("freezeAuthority")
-
-        if freeze_auth:
-            logger.warning(f"[HELIUS] {mint_address[:8]} has freeze authority — honeypot risk")
+        # Freeze authority = honeypot risk
+        if info.get("freezeAuthority"):
+            logger.warning(f"[HELIUS] {mint_address[:8]} has freeze authority")
             return True
 
         return False
 
     # ─────────────────────────────────────────
-    #  DEV WALLET TRACKER  (replaces mock)
+    #  DEV WALLET  (Free tier)
     # ─────────────────────────────────────────
 
     async def get_dev_wallet_pct(self, mint_address: str) -> float:
-        """
-        Returns fraction of supply held by largest wallet.
-        High concentration = dev wallet / rug risk.
-        """
-        resp = self._post_rpc("getTokenLargestAccounts", [mint_address])
-        result = resp.get("result", {})
-        accounts = result.get("value", [])
+        supply_resp = self._rpc("getTokenSupply", [mint_address])
+        supply      = float(supply_resp.get("result", {})
+                            .get("value", {}).get("uiAmount", 1) or 1)
 
-        if not accounts:
+        holders_resp = self._rpc("getTokenLargestAccounts", [mint_address])
+        holders      = holders_resp.get("result", {}).get("value", [])
+
+        if not holders:
             return 0.0
 
-        # Get total supply
-        supply_resp = self._post_rpc("getTokenSupply", [mint_address])
-        total = float(supply_resp.get("result", {})
-                      .get("value", {})
-                      .get("uiAmount", 1) or 1)
-
-        largest = float(accounts[0].get("uiAmount", 0) if accounts else 0)
-        pct     = largest / total if total > 0 else 0
-
-        logger.info(f"[HELIUS] {mint_address[:8]} largest holder: {pct:.1%}")
-        return round(pct, 4)
+        largest = float(holders[0].get("uiAmount", 0))
+        return round(largest / supply, 4) if supply > 0 else 0.0
 
     # ─────────────────────────────────────────
-    #  PUMP.FUN NEW TOKEN EVENTS
+    #  NEW PUMP TOKENS  (Free tier via signatures)
     # ─────────────────────────────────────────
 
-    async def get_new_pump_tokens(self, limit: int = 10) -> list[dict]:
-        """
-        Fetch recently launched Pump.fun tokens.
-        Real replacement for MockPumpFunWatcher.
-        """
-        PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+    async def get_new_pump_tokens(self, limit: int = 5) -> list[dict]:
+        PUMP_FUN = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-        resp = self._post_api(f"/addresses/{PUMP_FUN_PROGRAM}/transactions", {
-            "limit": limit,
-            "type":  "TOKEN_MINT",
-        })
+        # Get recent signatures for Pump.fun program
+        resp = self._rpc("getSignaturesForAddress", [
+            PUMP_FUN,
+            {"limit": limit}
+        ])
+        sigs = resp.get("result", [])
 
         tokens = []
-        txs    = resp if isinstance(resp, list) else []
+        for sig in sigs[:3]:   # Limit to avoid rate limiting
+            tx_resp = self._rpc("getTransaction", [
+                sig.get("signature", ""),
+                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+            ])
+            tx = tx_resp.get("result")
+            if not tx:
+                continue
 
-        for tx in txs:
-            mint = None
-            for transfer in tx.get("tokenTransfers", []):
-                if transfer.get("mint"):
-                    mint = transfer["mint"]
+            # Extract mint from post token balances
+            meta = tx.get("meta", {})
+            for bal in meta.get("postTokenBalances", []):
+                mint = bal.get("mint", "")
+                if mint and len(mint) >= 32:
+                    tokens.append({
+                        "event":     "new_launch",
+                        "symbol":    mint[:6].upper(),
+                        "mint":      mint,
+                        "timestamp": datetime.utcnow(),
+                    })
                     break
 
-            if mint:
-                tokens.append({
-                    "event":     "new_launch",
-                    "symbol":    mint[:6].upper(),   # placeholder until metadata fetched
-                    "mint":      mint,
-                    "timestamp": datetime.utcnow(),
-                    "scenario":  "real",
-                })
-
         return tokens
-
-    # ─────────────────────────────────────────
-    #  SOL PRICE  (for USD conversion)
-    # ─────────────────────────────────────────
-
-    def _get_sol_price(self) -> float:
-        """Get current SOL/USD price via Helius."""
-        try:
-            url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                data = json.loads(resp.read())
-                return float(data["solana"]["usd"])
-        except Exception:
-            return 150.0  # fallback
 
     # ─────────────────────────────────────────
     #  CONNECTION TEST
     # ─────────────────────────────────────────
 
     def test_connection(self) -> bool:
-        """Quick connectivity check."""
-        resp = self._post_rpc("getHealth", [])
+        resp = self._rpc("getHealth", [])
         ok   = resp.get("result") == "ok"
         logger.info(f"[HELIUS] Connection: {'✅ OK' if ok else '❌ FAIL'}")
         return ok
+
+    def _get_sol_price(self) -> float:
+        try:
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                return float(json.loads(resp.read())["solana"]["usd"])
+        except Exception:
+            return 150.0
+
+    def _empty_result(self, mint: str) -> dict:
+        return {
+            "mint":           mint,
+            "volume_sigma":   0.0,
+            "netflow_usd":    0.0,
+            "buy_count":      0,
+            "sell_count":     0,
+            "unique_wallets": 0,
+        }
